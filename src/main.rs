@@ -38,8 +38,8 @@ use std::ffi::CString;
 
 pub mod pymod;
 
-use oside;
 use clap::Parser as ClapParser;
+use oside;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -56,6 +56,14 @@ struct Opts {
     /// Override options from this yaml/json file
     #[clap(short, long)]
     options_override: Option<String>,
+
+    /// Print json corresponding to a given scapy expression
+    #[clap(short, long)]
+    print_json: bool,
+
+    /// Read json from stdin and verify it matches scapy_expr
+    #[clap(long)]
+    verify_json: bool,
 
     /// A level of verbosity, and can be used multiple times
     #[clap(short, long, parse(from_occurrences))]
@@ -81,17 +89,6 @@ fn main() {
         opts
     };
 
-    if opts.verbose > 4 {
-        let data = serde_json::to_string_pretty(&opts).unwrap();
-        println!("{}", data);
-        println!("===========");
-        let data = serde_yaml::to_string(&opts).unwrap();
-        println!("{}", data);
-    }
-
-    println!("Hello, here is your options: {:#?}", &opts);
-
-
     // The following code is in a block so the MainPythonInterpreter is destroyed in an
     // orderly manner, before process exit.
     let exit_code = {
@@ -113,34 +110,48 @@ fn main() {
                 // This will either call `interp.py_runmain()` or
                 // `interp.run_multiprocessing()`. If `interp.py_runmain()` is called,
                 // the interpreter is guaranteed to be finalized.
-                println!("About to run with scapy loaded");
                 // let dict: pyo3::types::PyDict = Default::default();
                 interp.with_gil(|py| {
-                    match py.run(
-                        "import scapy; from scapy.all import *; a=IP(); a.show()",
-                        None,
-                        None,
-                    ) {
-                        Ok(_) => {
-                            println!("python code executed successfully");
-                        }
-                        Err(e) => println!("python error: {:?}", e),
+                    match py.run("import scapy; from scapy.all import *", None, None) {
+                        Ok(_) => {}
+                        Err(e) => panic!("python error: {:?}", e),
                     }
                     let x: Vec<u8> = py
                         .eval(&format!("bytes({})", &opts.scapy_expr), None, None)
                         .unwrap()
                         .extract()
                         .unwrap();
-                    println!("X: {:02x?}", x);
                     {
-                        use oside::*;
                         use oside::protocols::all::ether;
+                        use oside::*;
+                        let pkt = Ether!().decode(&x).unwrap().0;
+                        let j = serde_json::to_string(&pkt.layers).unwrap();
+                        if opts.print_json {
+                            println!("{}", j);
+                        }
+                        if opts.verify_json {
+                            use std::io;
+                            use std::io::Read;
 
-                        let x = Ether!().decode(&x);
-                        println!("{:?}", &x);
+                            let mut input = Vec::new();
+                            let stdin = std::io::stdin();
+                            let mut handle = stdin.lock();
+                            handle.read_to_end(&mut input);
+                            let input = String::from_utf8(input).unwrap();
+                            if opts.verbose > 0 {
+                                eprintln!("Input: {:?}", &input);
+                            }
+                            let j0: serde_json::Value = serde_json::from_str(&input).unwrap();
+                            let j1: serde_json::Value = serde_json::from_str(&j).unwrap();
+                            if j0 != j1 {
+                                panic!(
+                                    "JSON mismatch!\n === expected: {:#?}\n === obtained: {:#?}",
+                                    &j0, &j1
+                                );
+                            }
+                        }
                     }
                     // py.run("from scapy.main import interact; interact()", None, None);
-                    
                 });
                 // interp.run()
                 0
